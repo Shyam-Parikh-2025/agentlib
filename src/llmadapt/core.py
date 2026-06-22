@@ -3,6 +3,8 @@ import json
 import inspect
 import urllib.request
 import urllib.error
+import threading
+import time
 from typing import get_type_hints, Callable
 
 
@@ -208,7 +210,6 @@ class Conversation:
                 })
         return gemini_history
 
-
 class ToolRegistry:
     """ Tool Registry Class:
     This class needs to handle tool storage and usage.
@@ -296,7 +297,6 @@ class ToolRegistry:
         elif provider == "gemini":
             return [{"functionDeclarations": schema_list}]
 
-
 class Agent:
     """ Agent Class:
     This is the core agent class that needs to have several key features:
@@ -308,7 +308,7 @@ class Agent:
     An overall Chat function that handles sending the payload to the AI model and handles the response. """
     
     DEFAULT_MODELS = {
-        "gemini": "gemini-1.5-flash",
+        "gemini": "gemini-3.5-flash",
         "anthropic": "claude-3-5-sonnet-20241022",
         "openai": "gpt-4o-mini",
         "ollama": "llama3.1:8b"
@@ -322,6 +322,15 @@ class Agent:
         self.change_api(provider=provider, model=model, base_url=base_url, api_key=api_key)
         self.set_max_tool_iterations(max_tool_iterations)
         self.max_tokens = max_tokens
+        self.thinking_stage = "initial state"
+
+    def _update_stage(self, stage: str, detail: str = "") -> None:
+        """Internal helper to safely mutate system tracking state and print visible console pipelines."""
+        self.thinking_stage = stage
+        if detail:
+            print(f"[{self.provider.upper()}] ➔ {stage}: {detail}", end="\n", flush=True)
+        else:
+            print(f"[{self.provider.upper()}] ➔ {stage}...", end="\n", flush=True)
 
     def set_max_tool_iterations(self, n: int):
         """Sets the upper threshold for consecutive tool execution cycles."""
@@ -370,50 +379,112 @@ class Agent:
         except urllib.error.URLError as e:
             raise RuntimeError(f"\n[Network Unreachable]: Check route {self.url}. Reason: {e.reason}")
 
+    def _execute_with_thread(self, func: Callable, error_container: list, results_container: list, *args, **kwargs):
+        """Executes any worker function in a separate thread and safely collects its outputs or crashes."""
+        
+        def worker():
+            """Internal closure block that catches target output signatures."""
+            try:
+                # Execute the actual target function with passed arguments
+                res = func(*args, **kwargs)
+                results_container.append(res)
+            except Exception as e:
+                # Capture target code crashes (like HTTP errors) so the main thread knows about them
+                error_container.append(e)
+
+        thread = threading.Thread(target=worker)
+        thread.daemon = True
+        thread.start()
+        
+        return thread
+            
+
     def chat(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None) -> str:
         self.conversation.add_user_msg(user_input)
         max_tokens = max_tokens if max_tokens is not None else self.max_tokens
 
+        self._update_stage("initial state")
+        
         iterations = 0 
         while True:
             iterations += 1
             if iterations > self.max_tool_iterations:
-                raise RuntimeError(
-                    f"Exceeded max_tool_iterations ({self.max_tool_iterations}) without a final "
-                    f"text response. Call agent.set_max_tool_iterations(n) to raise this limit."
-                )
+                raise RuntimeError(f"Exceeded max_tool_iterations ({self.max_tool_iterations})")
 
             history = self.conversation.export_for(self.provider, special_format=custom_format_func)
             tools = self.tool_registry.export_for(self.provider, special_format=custom_format_func)
             headers = {"Content-Type": "application/json"}
 
-            # --- GEMINI RUNTIME ---
+            # --- 1. COMPILE THE TARGET PAYLOAD ---
             if self.provider == "gemini":
                 if self.api_key: headers["x-goog-api-key"] = self.api_key
                 payload = {"contents": history}
                 if tools: payload["tools"] = tools
                 if self.conversation.system_instruction:
                     payload["systemInstruction"] = {"parts": [{"text": self.conversation.system_instruction}]}
-                
                 if max_tokens is not None:
                     payload["generationConfig"] = {"maxOutputTokens": max_tokens}
+            
+            elif self.provider == "anthropic":
+                if max_tokens is None: max_tokens = 4096
+                headers.update({"x-api-key": self.api_key, "anthropic-version": "2023-06-01"})
+                payload = {"model": self.model, "messages": history, "max_tokens": max_tokens}
+                if tools: payload["tools"] = tools
+                if self.conversation.system_instruction: payload["system"] = self.conversation.system_instruction
 
-                res = self._send_request(payload, headers)
-                
+            elif self.provider in ["openai", "custom"]:
+                if self.api_key: headers["Authorization"] = f"Bearer {self.api_key}"
+                payload = {"model": self.model, "messages": history}
+                if tools: payload["tools"] = tools
+                if max_tokens is not None:
+                    payload["max_completion_tokens"] = max_tokens
+                    payload["max_tokens"] = max_tokens
+
+            elif self.provider == "ollama":
+                payload = {"model": self.model, "messages": history, "stream": False}
+                if tools: payload["tools"] = tools
+                if max_tokens is not None: payload["options"] = {"num_predict": max_tokens}
+            else:
+                raise ValueError(f"Unsupported provider: {self.provider}. Please review how to configure custom providers.")
+
+            self._update_stage("Request sent to AI", f"Payload Size: {len(history)} turns")
+            
+            errors, results = [], []
+            
+            thread = self._execute_with_thread(self._send_request, errors, results, payload, headers)
+            
+            # Keep the main thread alive to animate a spinner while waiting for network bytes
+            spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            spinner_idx = 0
+            time.sleep(0.08)
+
+            while thread.is_alive():
+                print(f"\r[{self.provider.upper()}] ➔ Thinking {spinner_frames[spinner_idx]} ", end="", flush=True)
+                spinner_idx = (spinner_idx + 1) % len(spinner_frames)
+                time.sleep(0.08)
+            
+            # Clear the spinner trace line cleanly from the console terminal line
+            print("\r" + " " * 50 + "\r", end="", flush=True)
+
+            # Check if the background thread threw a network exception
+            if errors:
+                raise errors[0]
+
+            # Unpack the completed parsed json data dictionary
+            res = results[0]
+
+            # --- 3. PROCESS COMPLETED RESPONSE OBJECTS ---
+            if self.provider == "gemini":
                 if 'candidates' not in res or not res['candidates']:
                     error_msg = res.get('error', {}).get('message', 'Unknown Gemini API Error')
                     raise RuntimeError(f"Gemini API empty response or error: {error_msg}")
 
                 parts = res['candidates'][0]['content']['parts']
-
                 function_calls = [p['functionCall'] for p in parts if 'functionCall' in p]
                 text_parts = [p['text'] for p in parts if 'text' in p]
 
                 if function_calls:
-                    # Gemini now returns a unique "id" with each functionCall and
-                    # expects that same id echoed back in the functionResponse so
-                    # it can match results to requests (older model versions may
-                    # not send an id at all, so fallback to "" when absent).
+                    self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in function_calls]))
                     tool_calls = [{"id": function_call.get("id", ""),
                                    "function": {"name": function_call['name'], "arguments": function_call.get('args', {})}}
                                   for function_call in function_calls]
@@ -426,114 +497,111 @@ class Agent:
                     for function_call in function_calls:
                         name, args = function_call['name'], function_call.get('args', {})
                         call_id = function_call.get("id", "")
+                        
+                        self._update_stage("Running Tool Local Process", f"Invoking function '{name}'")
                         out_str = self.tool_registry.execute(name, args)
+                        
                         function_response = {"name": name, "response": {"result": out_str}}
-                        if call_id:
-                            function_response["id"] = call_id
+                        if call_id: function_response["id"] = call_id
                         self.conversation.history.append({
-                            "role": "tool", "name": name, "content": out_str,
-                            "tool_call_id": call_id,
+                            "role": "tool", "name": name, "content": out_str, "tool_call_id": call_id,
                             "_native": {"role": "user", "parts": [{"functionResponse": function_response}]},
                             "_native_provider": "gemini"
                         })
+                    self._update_stage("Tool results sent to AI")
                     continue
+                
                 text = "".join(text_parts)
                 self.conversation.add_model_msg(text=text)
+                self._update_stage("Success")
                 return text
             
-            # --- ANTHROPIC RUNTIME ---
             elif self.provider == "anthropic":
-                if max_tokens is None:
-                    max_tokens = 4096
-                headers.update({"x-api-key": self.api_key, "anthropic-version": "2023-06-01"})
-                payload = {"model": self.model, "messages": history, "max_tokens": max_tokens}
-                if tools: payload["tools"] = tools
-                if self.conversation.system_instruction: payload["system"] = self.conversation.system_instruction
-
-                res = self._send_request(payload, headers)
                 t_calls, final_text = [], ""
-                
                 for block in res.get("content", []):
                     if block["type"] == "text": final_text += block["text"]
                     elif block["type"] == "tool_use":
                         t_calls.append({"id": block["id"], "function": {"name": block["name"], "arguments": block["input"]}})
                 
                 if t_calls:
+                    self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in t_calls]))
                     self.conversation.add_model_msg(
-                        text=final_text if final_text else None,
-                        tool_calls=t_calls,
-                        native={"role": "assistant", "content": res.get("content", [])},
-                        native_provider="anthropic"
+                        text=final_text if final_text else None, tool_calls=t_calls,
+                        native={"role": "assistant", "content": res.get("content", [])}, native_provider="anthropic"
                     )
                     tool_result_blocks = []
                     for tc in t_calls:
+                        self._update_stage("Running Tool Local Process", f"Invoking function '{tc['function']['name']}'")
                         out_str = self.tool_registry.execute(tc["function"]["name"], tc["function"]["arguments"])
                         tool_result_blocks.append({"type": "tool_result", "tool_use_id": tc["id"], "content": out_str})
+                    
                     native_user_msg = {"role": "user", "content": tool_result_blocks}
                     for tc, block in zip(t_calls, tool_result_blocks):
                         self.conversation.history.append({
-                            "role": "tool", "name": tc["function"]["name"], "content": block["content"],
-                            "tool_call_id": tc["id"],
+                            "role": "tool", "name": tc["function"]["name"], "content": block["content"], "tool_call_id": tc["id"],
                             "_native": native_user_msg, "_native_provider": "anthropic"
                         })
+                    self._update_stage("Tool results sent to AI")
                     continue
+                
                 self.conversation.add_model_msg(text=final_text)
+                self._update_stage("Success")
                 return final_text
 
-            # --- OPENAI / CUSTOM MOCK RUNTIME ---
             elif self.provider in ["openai", "custom"]:
-                if self.api_key: headers["Authorization"] = f"Bearer {self.api_key}"
-                payload = {"model": self.model, "messages": history}
-                if tools: payload["tools"] = tools
-
-                if max_tokens is not None:
-                    payload["max_completion_tokens"] = max_tokens
-                    payload["max_tokens"] = max_tokens
-
-                res = self._send_request(payload, headers)
-                
-                if 'choices' not in res or not res['choices']:
-                    error_msg = res.get('error', {}).get('message', 'Unknown OpenAI API Error')
-                    raise RuntimeError(f"OpenAI API empty response or error: {error_msg}")
-
                 msg = res['choices'][0]['message']
-                
                 if msg.get("tool_calls"):
+                    self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in msg["tool_calls"]]))
                     self.conversation.add_model_msg(text=msg.get("content"), tool_calls=msg["tool_calls"])
                     for tool_call in msg["tool_calls"]:
                         name = tool_call["function"]["name"]
                         args = json.loads(tool_call["function"]["arguments"]) if isinstance(tool_call["function"]["arguments"], str) else tool_call["function"]["arguments"]
+                        
+                        self._update_stage("Running Tool Local Process", f"Invoking function '{name}'")
                         out_str = self.tool_registry.execute(name, args)
                         self.conversation.add_tool_response(name, out_str, tool_call["id"]) 
+                    self._update_stage("Tool results sent to AI")
                     continue
+                
                 text = msg.get("content", "")
                 self.conversation.add_model_msg(text=text)
+                self._update_stage("Success")
                 return text
             
-            # --- OLLAMA RUNTIME ---
             elif self.provider == "ollama":
-                payload = {"model": self.model, "messages": history, "stream": False}
-                if tools: payload["tools"] = tools
-                if max_tokens is not None:
-                    payload["options"] = {"num_predict": max_tokens}
-
-                res = self._send_request(payload, headers)
                 msg = res.get("message", {})
-                
                 if msg.get("tool_calls"):
-                    self.conversation.add_model_msg(text=msg.get("content"), tool_calls=msg["tool_calls"])
-                    for tool_call in msg["tool_calls"]:
-                        name, args = tool_call["function"]["name"], tool_call["function"]["arguments"]
+                    self._update_stage("Tool asked by AI: \n", str([f"   -{fc}" for fc in msg["tool_calls"]]))
+                    
+                    sanitized_calls = []
+                    for tc in msg["tool_calls"]:
+                        func = tc.get("function") or {}
+                        args = func.get("arguments") or {}
+                        if isinstance(args, str) and args.strip():
+                            try: args = json.loads(args)
+                            except json.JSONDecodeError: args = {}
+                        elif isinstance(args, str): args = {}
+                        sanitized_calls.append({
+                            "id": tc.get("id"),
+                            "function": {"name": func.get("name"), "arguments": args}
+                        })
+
+                    self.conversation.add_model_msg(text=msg.get("content"), tool_calls=sanitized_calls)
+                    for tc in sanitized_calls:
+                        name, args = tc["function"]["name"], tc["function"]["arguments"]
+                        self._update_stage("Running Tool Local Process", f"Invoking function '{name}'")
                         out_str = self.tool_registry.execute(name, args)
-                        self.conversation.add_tool_response(name, out_str, tool_call.get("id"))
+                        self.conversation.add_tool_response(name, out_str, tc.get("id"))
+                    self._update_stage("Tool results sent to AI")
                     continue
+                
                 text = msg.get("content", "")
                 self.conversation.add_model_msg(text=text)
+                self._update_stage("Success")
                 return text
 
     def change_default_max_tokens(self, max_tokens: int):
         self.max_tokens = max_tokens
-
 
 def _stringify_tool_output(out) -> str:
     """Serializes tool return values into valid JSON strings for model consumption."""
@@ -543,3 +611,25 @@ def _stringify_tool_output(out) -> str:
         return json.dumps(out)
     except TypeError:
         return str(out)
+
+def test():
+    import dotenv
+    dotenv.load_dotenv()
+    agent = Agent('gemini', 'gemini-3.5-flash')
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() == "quit":
+            break
+        response = agent.chat(user_input)
+        print(f"Agent: {response}")
+    
+    agent = Agent('ollama', 'llama3')
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() == "quit":
+            break
+        response = agent.chat(user_input)
+        print(f"Agent: {response}")
+
+if __name__ == "__main__":
+    test()
