@@ -1,4 +1,4 @@
-# forgeagent
+# agentcraft
 
 A small, zero-dependency, provider-agnostic agent for chatting with LLMs and
 giving them tools. Works with Anthropic, OpenAI, Gemini, and Ollama using only
@@ -10,21 +10,21 @@ v0.1.0
 From source (until published to PyPI):
 
 ```bash
-git clone https://github.com/Shyam-Parikh-2025/forgeagent.git
-cd forgeagent
+git clone https://github.com/Shyam-Parikh-2025/agentcraft.git
+cd agentcraft
 pip install -e .
 ```
 
 Once published:
 
 ```bash
-pip install forgeagent
+pip install agentcraft
 ```
 
 ## Quick start
 
 ```python
-from forgeagent import Agent
+from agentcraft import Agent
 
 agent = Agent(
     provider="anthropic",
